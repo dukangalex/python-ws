@@ -7,11 +7,11 @@ import socket
 import struct
 import hashlib
 import base64
-import subprocess
 import asyncio
 import aiohttp
-import ipaddress
 import logging
+import ipaddress
+import subprocess
 from aiohttp import web
 
 # 环境变量
@@ -19,16 +19,15 @@ UUID = os.environ.get('UUID', '7bd180e8-1142-4387-93f5-03e8d750a896')   # 节点
 NEZHA_SERVER = os.environ.get('NEZHA_SERVER', '')    # 哪吒v0填写格式: nezha.xxx.com  哪吒v1填写格式: nezha.xxx.com:8008
 NEZHA_PORT = os.environ.get('NEZHA_PORT', '')        # 哪吒v1请留空，哪吒v0 agent端口
 NEZHA_KEY = os.environ.get('NEZHA_KEY', '')          # 哪吒v0或v1密钥，哪吒面板后台命令里获取
-DOMAIN = os.environ.get('DOMAIN', '')                # 分配的域名或反代后的域名,不包含https://前缀,例如: domain.xxx.com
+DOMAIN = os.environ.get('DOMAIN', '')                # 项目分配的域名或反代后的域名,不包含https://前缀,例如: domain.xxx.com
 SUB_PATH = os.environ.get('SUB_PATH', 'sub')         # 节点订阅token
 NAME = os.environ.get('NAME', '')                    # 节点名称
 WSPATH = os.environ.get('WSPATH', UUID[:8])          # 节点路径
 PORT = int(os.environ.get('SERVER_PORT') or os.environ.get('PORT') or 3000)  # http和ws端口，默认自动优先获取容器分配的端口
-AUTO_ACCESS = os.environ.get('AUTO_ACCESS', '').lower() == 'true'            # 自动访问保活,默认关闭,true开启,false关闭,需同时填写DOMAIN变量
-DEBUG = os.environ.get('DEBUG', '').lower() == 'true' # 调试使用，保持默认,true开启调试
+AUTO_ACCESS = os.environ.get('AUTO_ACCESS', '').lower() == 'true' # 自动访问保活,默认关闭,true开启,false关闭,需同时填写DOMAIN变量
+DEBUG = os.environ.get('DEBUG', '').lower() == 'true' # 保持默认,调试使用,true开启调试
 
 # 全局变量
-PROTOCOL_UUID = UUID.replace('-', '')
 CurrentDomain = DOMAIN
 CurrentPort = 443
 Tls = 'tls'
@@ -42,13 +41,13 @@ BLOCKED_DOMAINS = [
 ]
 
 # 日志级别
-log_level = logging.DEBUG if DEBUG else logging.WARNING 
+log_level = logging.DEBUG if DEBUG else logging.INFO
 logging.basicConfig(
     level=log_level,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# 禁用访问日志
+# 禁用访问,连接等日志
 logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
 logging.getLogger('aiohttp.server').setLevel(logging.WARNING)
 logging.getLogger('aiohttp.client').setLevel(logging.WARNING)
@@ -262,16 +261,22 @@ class ProxyHandler:
             
             received_hash_bytes = first_msg[:56]
             
-            # 验证密码
-            hash_obj = hashlib.sha224()
-            hash_obj.update(self.uuid.encode())
-            expected_hash_bytes = hash_obj.digest()  # 获取字节
+            # 验证密码 - 支持标准UUID和无短横线UUID
+            hash_obj1 = hashlib.sha224()
+            hash_obj1.update(self.uuid.encode())
+            expected_hash_hex1 = hash_obj1.hexdigest()
+            
+            # 尝试使用标准UUID（带短横线）
+            standard_uuid = UUID
+            hash_obj2 = hashlib.sha224()
+            hash_obj2.update(standard_uuid.encode())
+            expected_hash_hex2 = hash_obj2.hexdigest()
             
             # 转换为hex字符串进行比较
             received_hash_hex = received_hash_bytes.decode('ascii', errors='ignore')
-            expected_hash_hex = hash_obj.hexdigest()
             
-            if received_hash_hex != expected_hash_hex:
+            # 检查是否匹配任一UUID格式
+            if received_hash_hex != expected_hash_hex1 and received_hash_hex != expected_hash_hex2:
                 return False
             
             offset = 56
@@ -358,7 +363,7 @@ class ProxyHandler:
             
         except Exception as e:
             if DEBUG:
-                logger.error(f"Trojan handler error: {e}")
+                logger.error(f"Tro handler error: {e}")
             return False
     
     async def handle_shadowsocks(self, websocket, first_msg: bytes) -> bool:
@@ -405,6 +410,7 @@ class ProxyHandler:
                 await websocket.close()
                 return False
             
+            # 连接目标
             resolved_host = await resolve_host(host)
             
             try:
@@ -455,14 +461,14 @@ class ProxyHandler:
 async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    
+    CUUID = UUID.replace('-', '')
     path = request.path
     
     if f'/{WSPATH}' not in path:
         await ws.close()
         return ws
     
-    proxy = ProxyHandler(PROTOCOL_UUID)
+    proxy = ProxyHandler(CUUID)
     
     try:
         first_msg = await asyncio.wait_for(ws.receive(), timeout=5)
@@ -472,14 +478,17 @@ async def websocket_handler(request):
         
         msg_data = first_msg.data
         
+        # 尝试VLS
         if len(msg_data) > 17 and msg_data[0] == 0:
             if await proxy.handle_vless(ws, msg_data):
                 return ws
         
+        # 尝试Tro
         if len(msg_data) >= 58:
             if await proxy.handle_trojan(ws, msg_data):
                 return ws
         
+        # 尝试ss
         if len(msg_data) > 0 and msg_data[0] in (1, 3, 4):
             if await proxy.handle_shadowsocks(ws, msg_data):
                 return ws
@@ -514,7 +523,7 @@ async def http_handler(request):
         
         # 生成配置链接
         vless_url = f"vless://{UUID}@{CurrentDomain}:{CurrentPort}?encryption=none&security={tls_param}&sni={CurrentDomain}&fp=chrome&type=ws&host={CurrentDomain}&path=%2F{WSPATH}#{name_part}"
-        trojan_url = f"trojan://{PROTOCOL_UUID}@{CurrentDomain}:{CurrentPort}?security={tls_param}&sni={CurrentDomain}&fp=chrome&type=ws&host={CurrentDomain}&path=%2F{WSPATH}#{name_part}"
+        trojan_url = f"trojan://{UUID}@{CurrentDomain}:{CurrentPort}?security={tls_param}&sni={CurrentDomain}&fp=chrome&type=ws&host={CurrentDomain}&path=%2F{WSPATH}#{name_part}"
         
         ss_method_password = base64.b64encode(f"none:{UUID}".encode()).decode()
         ss_url = f"ss://{ss_method_password}@{CurrentDomain}:{CurrentPort}?plugin=v2ray-plugin;mode%3Dwebsocket;host%3D{CurrentDomain};path%3D%2F{WSPATH};{ss_tls_param}sni%3D{CurrentDomain};skip-cert-verify%3Dtrue;mux%3D0#{name_part}"
@@ -554,7 +563,7 @@ async def download_file():
                     with open('npm', 'wb') as f:
                         f.write(content)
                     os.chmod('npm', 0o755)
-                    logger.info('nz downloaded successfully')
+                    logger.info('✅ npm downloaded successfully')
     except Exception as e:
         logger.error(f'Download failed: {e}')
 
@@ -567,7 +576,7 @@ async def run_nezha():
     except:
         pass
     
-    # 下载文件
+    # 等待文件下载完成
     await download_file()
     
     command = ''
@@ -608,9 +617,9 @@ uuid: {UUID}"""
     
     try:
         subprocess.Popen(command, shell=True, executable='/bin/bash')
-        logger.info('npm is running')
+        logger.info('✅ nz started successfully')
     except Exception as e:
-        logger.error(f'Error running npm: {e}')
+        logger.error(f'Error running nz: {e}')
 
 async def add_access_task():
     if not AUTO_ACCESS or not DOMAIN:
@@ -660,7 +669,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', actual_port)
     await site.start()
-    print(f"Server is running on port {actual_port}")
+    logger.info(f"✅ server is running on port {actual_port}")
     asyncio.create_task(run_nezha())
     async def delayed_cleanup():
         await asyncio.sleep(180)
